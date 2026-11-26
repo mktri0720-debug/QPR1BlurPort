@@ -8,12 +8,14 @@ import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.LayerDrawable
+import android.graphics.drawable.RippleDrawable
 import android.os.Build
 import android.view.View
 import android.view.ViewGroup
 import android.view.Window
 import android.view.WindowManager
 import android.widget.PopupWindow
+import android.widget.SeekBar
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
@@ -25,27 +27,25 @@ class BlurHookEntry : IXposedHookLoadPackage {
     companion object {
         private const val TAG = "[QPR1BlurPort]"
 
-        // 音量条/弹窗本体的高斯模糊半径（像素）：推荐 70 ~ 120
+        // 仅作用于音量条/菜单面板本体的高斯模糊半径（像素）
         private const val PANEL_BLUR_RADIUS_PX = 90
 
-        // 音量条/弹窗本体的底色不透明度（0~255）：原版为 255（纯实心），推荐 150 ~ 185
-        private const val PANEL_BG_ALPHA = 165
+        // 面板与静音按钮外圈的底色不透明度（0~255）：原版为 255（纯实心）
+        private const val PANEL_BG_ALPHA = 160
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
 
-        XposedBridge.log("$TAG 已注入 SystemUI，启用面板本体毛玻璃引擎...")
+        XposedBridge.log("$TAG 已注入 SystemUI，启用面板本体与按钮毛玻璃引擎...")
 
-        hookDialogs(lpparam.classLoader)
-        hookPopupWindows(lpparam.classLoader)
-        hookVolumeOverlayWindows(lpparam.classLoader)
+        hookDialogs()
+        hookPopupWindows()
+        hookOverlayWindows(lpparam.classLoader)
+        hookEmbeddedDropoutViews()
     }
 
-    /**
-     * 1. 拦截所有音量面板与快捷设置二级弹窗 Dialog（仅模糊面板本体，不模糊全屏背景）
-     */
-    private fun hookDialogs(classLoader: ClassLoader) {
+    private fun hookDialogs() {
         XposedBridge.hookAllMethods(Dialog::class.java, "onStart", object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 try {
@@ -53,12 +53,12 @@ class BlurHookEntry : IXposedHookLoadPackage {
                     val className = dialog.javaClass.name
                     val window = dialog.window ?: return
 
-                    if (isTargetUiComponent(className)) {
+                    if (isTargetComponent(className)) {
                         applyPanelOnlyBlur(window, PANEL_BLUR_RADIUS_PX)
                         window.decorView.let { decor ->
                             makeContainerTranslucent(decor, PANEL_BG_ALPHA, 0)
                         }
-                        XposedBridge.log("$TAG 面板本体毛玻璃已注入 Dialog: $className")
+                        XposedBridge.log("$TAG 面板毛玻璃已注入 Dialog: $className")
                     }
                 } catch (t: Throwable) {
                     XposedBridge.log("$TAG Dialog Hook 异常: ${t.message}")
@@ -67,10 +67,7 @@ class BlurHookEntry : IXposedHookLoadPackage {
         })
     }
 
-    /**
-     * 2. 拦截快捷设置二级浮层常用的 PopupWindow
-     */
-    private fun hookPopupWindows(classLoader: ClassLoader) {
+    private fun hookPopupWindows() {
         XposedBridge.hookAllMethods(PopupWindow::class.java, "showAtLocation", object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 handlePopupWindow(param.thisObject as? PopupWindow)
@@ -93,17 +90,13 @@ class BlurHookEntry : IXposedHookLoadPackage {
             val viewRootImpl = XposedHelpers.callMethod(rootView, "getViewRootImpl")
             if (viewRootImpl != null) {
                 XposedHelpers.callMethod(viewRootImpl, "setBackgroundBlurRadius", PANEL_BLUR_RADIUS_PX)
-                XposedBridge.log("$TAG 面板本体毛玻璃已注入 PopupWindow")
             }
         } catch (t: Throwable) {
             XposedBridge.log("$TAG PopupWindow Hook 异常: ${t.message}")
         }
     }
 
-    /**
-     * 3. 拦截独立悬浮窗口形态的音量滑块胶囊（仅设置窗口自身轮廓内模糊）
-     */
-    private fun hookVolumeOverlayWindows(classLoader: ClassLoader) {
+    private fun hookOverlayWindows(classLoader: ClassLoader) {
         val wmgClass = XposedHelpers.findClassIfExists(
             "android.view.WindowManagerGlobal",
             classLoader
@@ -117,18 +110,22 @@ class BlurHookEntry : IXposedHookLoadPackage {
                     val params = param.args[1] as? WindowManager.LayoutParams ?: return
 
                     val title = params.title?.toString() ?: ""
-                    // 匹配音量条窗口类型 (2020 = TYPE_VOLUME_OVERLAY) 或标题含 Volume 的浮层
-                    val isVolumeWindow = params.type == 2020 ||
-                            title.contains("Volume", ignoreCase = true)
+                    val isTargetWindow = params.type == 2020 ||
+                            params.type == 2017 ||
+                            params.type == 2008 ||
+                            isTargetComponent(title)
 
-                    if (isVolumeWindow && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                        // 必须设为半透明像素格式，否则面板无法透出底部模糊；不设置 blurBehindRadius 以免糊掉屏幕背景
+                    if (isTargetWindow && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                         params.format = PixelFormat.TRANSLUCENT
+                        // 彻底清除全屏背景模糊与全屏变暗标志，确保桌面背景 100% 清晰
+                        params.flags = params.flags and
+                                WindowManager.LayoutParams.FLAG_BLUR_BEHIND.inv() and
+                                WindowManager.LayoutParams.FLAG_DIM_BEHIND.inv()
+                        params.blurBehindRadius = 0
 
                         view.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
                             override fun onViewAttachedToWindow(v: View) {
                                 try {
-                                    // 仅对当前窗口自身轮廓区域启用硬件高斯模糊
                                     val viewRootImpl = XposedHelpers.callMethod(v, "getViewRootImpl")
                                     if (viewRootImpl != null) {
                                         XposedHelpers.callMethod(
@@ -138,9 +135,11 @@ class BlurHookEntry : IXposedHookLoadPackage {
                                         )
                                     }
                                     makeContainerTranslucent(v, PANEL_BG_ALPHA, 0)
-                                    XposedBridge.log("$TAG 音量条本体毛玻璃已注入悬浮窗: $title")
+                                    // 延迟一帧再次处理异步加载的静音按钮背景
+                                    v.post { makeContainerTranslucent(v, PANEL_BG_ALPHA, 0) }
+                                    XposedBridge.log("$TAG 音量条本体及按钮毛玻璃已注入: $title")
                                 } catch (e: Throwable) {
-                                    XposedBridge.log("$TAG 音量悬浮窗模糊异常: ${e.message}")
+                                    XposedBridge.log("$TAG 悬浮窗口模糊异常: ${e.message}")
                                 }
                             }
 
@@ -154,32 +153,51 @@ class BlurHookEntry : IXposedHookLoadPackage {
         })
     }
 
-    private fun isTargetUiComponent(className: String): Boolean {
-        return className.contains("Volume", ignoreCase = true) ||
-                className.contains("SystemUIDialog", ignoreCase = true) ||
-                className.contains("QS", ignoreCase = true) ||
-                className.contains("Detail", ignoreCase = true)
+    private fun hookEmbeddedDropoutViews() {
+        XposedBridge.hookAllMethods(ViewGroup::class.java, "addView", object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                try {
+                    val child = param.args.firstOrNull() as? View ?: return
+                    val name = child.javaClass.name
+                    if (name.contains("QSDetail", ignoreCase = true) ||
+                        name.contains("Dropdown", ignoreCase = true) ||
+                        name.contains("PopupMenu", ignoreCase = true)
+                    ) {
+                        makeContainerTranslucent(child, PANEL_BG_ALPHA, 0)
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+        })
     }
 
-    /**
-     * 仅对 Window 自身表面轮廓内进行背景采样模糊，保持窗口外部的全屏壁纸/应用完全清晰
-     */
+    private fun isTargetComponent(name: String): Boolean {
+        return name.contains("Volume", ignoreCase = true) ||
+                name.contains("SystemUIDialog", ignoreCase = true) ||
+                name.contains("QS", ignoreCase = true) ||
+                name.contains("Detail", ignoreCase = true) ||
+                name.contains("Menu", ignoreCase = true) ||
+                name.contains("Media", ignoreCase = true) ||
+                name.contains("Output", ignoreCase = true) ||
+                name.contains("Popup", ignoreCase = true)
+    }
+
     private fun applyPanelOnlyBlur(window: Window, radiusPx: Int) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             window.setFormat(PixelFormat.TRANSLUCENT)
-            // 清除任何可能存在的全屏背景变暗或全屏模糊标志
             window.clearFlags(WindowManager.LayoutParams.FLAG_BLUR_BEHIND)
+            window.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+            window.attributes = window.attributes.apply { blurBehindRadius = 0 }
             window.setBackgroundBlurRadius(radiusPx)
         }
     }
 
     /**
-     * 递归穿透背景 Drawable 与 Tint 着色层，将实心面板底色改为半透明毛玻璃底色
+     * 递归穿透背景 Drawable（含 RippleDrawable 水波纹按钮底色）与 Tint 着色层，跳过音量滑块进度条
      */
     private fun makeContainerTranslucent(view: View, alpha: Int, depth: Int) {
-        if (depth > 5) return
+        if (depth > 8 || view is SeekBar) return
 
-        // 1. 处理 View 自身的 backgroundTintList（现代 Material 3 胶囊常用 tint 覆盖颜色）
         view.backgroundTintList?.let { tintList ->
             val defaultColor = tintList.defaultColor
             val translucentColor = Color.argb(
@@ -191,7 +209,6 @@ class BlurHookEntry : IXposedHookLoadPackage {
             view.backgroundTintList = ColorStateList.valueOf(translucentColor)
         }
 
-        // 2. 处理 Drawable 本身的不透明度
         view.background?.let { bg ->
             val mutated = bg.mutate()
             applyAlphaToDrawable(mutated, alpha)
@@ -207,6 +224,11 @@ class BlurHookEntry : IXposedHookLoadPackage {
 
     private fun applyAlphaToDrawable(drawable: Drawable, alpha: Int) {
         when (drawable) {
+            is RippleDrawable -> {
+                for (i in 0 until drawable.numberOfLayers) {
+                    applyAlphaToDrawable(drawable.getDrawable(i), alpha)
+                }
+            }
             is LayerDrawable -> {
                 for (i in 0 until drawable.numberOfLayers) {
                     applyAlphaToDrawable(drawable.getDrawable(i), alpha)
