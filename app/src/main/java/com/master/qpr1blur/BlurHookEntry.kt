@@ -8,6 +8,7 @@ import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.LayerDrawable
 import android.os.Build
 import android.view.View
+import android.view.ViewGroup
 import android.view.Window
 import android.view.WindowManager
 import de.robv.android.xposed.IXposedHookLoadPackage
@@ -20,117 +21,130 @@ class BlurHookEntry : IXposedHookLoadPackage {
 
     companion object {
         private const val TAG = "[QPR1BlurPort]"
-        
-        // 模糊半径（像素）：推荐 60 ~ 120，数值越大越朦胧
+
+        // 模糊半径（像素）：推荐 60 ~ 120
         private const val BLUR_RADIUS_PX = 85
-        
-        // 背景遮罩不透明度（0~255）：原版为 255（纯实心），推荐 165 ~ 195 之间兼顾可读性与通透感
+
+        // 背景遮罩不透明度（0~255）：原版为 255，推荐 165 ~ 195
         private const val PANEL_BG_ALPHA = 175
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
 
-        XposedBridge.log("$TAG 已注入 SystemUI，开始挂载 QPR1 模糊特性...")
+        XposedBridge.log("$TAG 已注入 SystemUI，启用通用窗口与弹窗模糊引擎...")
 
-        hookVolumeDialog(lpparam.classLoader)
-        hookSystemUIDialog(lpparam.classLoader)
+        hookAllDialogs(lpparam.classLoader)
+        hookWindowManagerGlobal(lpparam.classLoader)
     }
 
     /**
-     * 1. 适配音量滑块与展开面板 (VolumeDialogImpl)
+     * 方案一：通杀所有 SystemUI 内的 Dialog（涵盖新版/索尼定制音量面板与快捷设置二级菜单）
      */
-    private fun hookVolumeDialog(classLoader: ClassLoader) {
-        val volumeDialogClass = XposedHelpers.findClassIfExists(
-            "com.android.systemui.volume.VolumeDialogImpl",
-            classLoader
-        )
-        if (volumeDialogClass == null) {
-            XposedBridge.log("$TAG 未找到 VolumeDialogImpl，跳过")
-            return
-        }
-
-        // Hook initDialog 方法，在对话框初始化完成时修改 Window 与视图背景
-        XposedBridge.hookAllMethods(volumeDialogClass, "initDialog", object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                try {
-                    val instance = param.thisObject
-                    val dialog = XposedHelpers.getObjectField(instance, "mDialog") as? Dialog
-                    val window = dialog?.window ?: return
-
-                    applyWindowBlur(window, BLUR_RADIUS_PX)
-
-                    // 获取音量面板主容器视图并调低背景不透明度
-                    val dialogView = XposedHelpers.getObjectField(instance, "mDialogView") as? View
-                    dialogView?.let { makeViewBackgroundTranslucent(it, PANEL_BG_ALPHA) }
-
-                    // 如果存在独立的行容器 (mDialogRowsView)，也一并处理
-                    val rowsView = XposedHelpers.getObjectField(instance, "mDialogRowsView") as? View
-                    rowsView?.let { makeViewBackgroundTranslucent(it, PANEL_BG_ALPHA) }
-
-                    XposedBridge.log("$TAG VolumeDialogImpl 高斯模糊注入成功！")
-                } catch (t: Throwable) {
-                    XposedBridge.log("$TAG VolumeDialogImpl 注入异常: ${t.message}")
-                }
-            }
-        })
-    }
-
-    /**
-     * 2. 适配快捷设置二级菜单与系统弹窗 (SystemUIDialog)
-     */
-    private fun hookSystemUIDialog(classLoader: ClassLoader) {
-        val sysUiDialogClass = XposedHelpers.findClassIfExists(
-            "com.android.systemui.statusbar.phone.SystemUIDialog",
-            classLoader
-        )
-        if (sysUiDialogClass == null) {
-            XposedBridge.log("$TAG 未找到 SystemUIDialog，跳过")
-            return
-        }
-
-        // 在所有 SystemUIDialog 准备显示 (onStart) 时挂载模糊
-        XposedBridge.hookAllMethods(sysUiDialogClass, "onStart", object : XC_MethodHook() {
+    private fun hookAllDialogs(classLoader: ClassLoader) {
+        XposedBridge.hookAllMethods(Dialog::class.java, "onStart", object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 try {
                     val dialog = param.thisObject as? Dialog ?: return
+                    val className = dialog.javaClass.name
                     val window = dialog.window ?: return
 
-                    applyWindowBlur(window, BLUR_RADIUS_PX)
-
-                    // 调整 DecorView 的背景透明度
-                    window.decorView.let { decor ->
-                        makeViewBackgroundTranslucent(decor, PANEL_BG_ALPHA)
+                    // 过滤出音量面板、快捷设置弹窗及系统级对话框
+                    if (className.contains("Volume", ignoreCase = true) ||
+                        className.contains("SystemUIDialog", ignoreCase = true) ||
+                        className.contains("QS", ignoreCase = true) ||
+                        className.contains("Detail", ignoreCase = true)
+                    ) {
+                        applyWindowBlur(window, BLUR_RADIUS_PX)
+                        window.decorView.let { decor ->
+                            makeViewTreeTranslucent(decor, PANEL_BG_ALPHA, 0)
+                        }
+                        XposedBridge.log("$TAG 已为 Dialog 注入模糊: $className")
                     }
                 } catch (t: Throwable) {
-                    XposedBridge.log("$TAG SystemUIDialog 注入异常: ${t.message}")
+                    XposedBridge.log("$TAG Dialog Hook 异常: ${t.message}")
                 }
             }
         })
     }
 
     /**
-     * 核心工具：为 Window 启用原生硬件背景模糊
+     * 方案二：底层 WindowManagerGlobal 拦截（专治非 Dialog 形态的独立悬浮音量条）
      */
+    private fun hookWindowManagerGlobal(classLoader: ClassLoader) {
+        val wmgClass = XposedHelpers.findClassIfExists(
+            "android.view.WindowManagerGlobal",
+            classLoader
+        ) ?: return
+
+        XposedBridge.hookAllMethods(wmgClass, "addView", object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                try {
+                    if (param.args.size < 2) return
+                    val view = param.args[0] as? View ?: return
+                    val params = param.args[1] as? WindowManager.LayoutParams ?: return
+
+                    val title = params.title?.toString() ?: ""
+                    // 匹配音量面板窗口类型 (2020 = TYPE_VOLUME_OVERLAY) 或标题含 Volume 的悬浮层
+                    val isVolumeWindow = params.type == 2020 ||
+                            title.contains("Volume", ignoreCase = true)
+
+                    if (isVolumeWindow && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        params.format = PixelFormat.TRANSLUCENT
+                        params.flags = params.flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND
+                        params.blurBehindRadius = 20
+
+                        // 通过 ViewRootImpl/SurfaceControl 设置窗口自身背景模糊
+                        view.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+                            override fun onViewAttachedToWindow(v: View) {
+                                try {
+                                    val viewRootImpl = XposedHelpers.callMethod(v, "getViewRootImpl")
+                                    if (viewRootImpl != null) {
+                                        XposedHelpers.callMethod(
+                                            viewRootImpl,
+                                            "setBackgroundBlurRadius",
+                                            BLUR_RADIUS_PX
+                                        )
+                                    }
+                                    makeViewTreeTranslucent(v, PANEL_BG_ALPHA, 0)
+                                    XposedBridge.log("$TAG 已为悬浮音量窗口注入模糊: $title")
+                                } catch (e: Throwable) {
+                                    XposedBridge.log("$TAG 悬浮窗口附加模糊异常: ${e.message}")
+                                }
+                            }
+
+                            override fun onViewDetachedFromWindow(v: View) {}
+                        })
+                    }
+                } catch (t: Throwable) {
+                    XposedBridge.log("$TAG WindowManagerGlobal Hook 异常: ${t.message}")
+                }
+            }
+        })
+    }
+
     private fun applyWindowBlur(window: Window, radiusPx: Int) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            // 确保窗口支持半透明像素格式，否则底层渲染器会忽略 Alpha 通道
             window.setFormat(PixelFormat.TRANSLUCENT)
             window.addFlags(WindowManager.LayoutParams.FLAG_BLUR_BEHIND)
-            
-            // 设置窗口背景高斯模糊半径（仅模糊窗口自身轮廓内的背景）
             window.setBackgroundBlurRadius(radiusPx)
         }
     }
 
     /**
-     * 核心工具：递归将视图背景 Drawable 转为半透明，保留圆角和动态取色
+     * 递归将外层容器背景转为半透明（深度限制 4 层，避免误伤内部文字与滑块进度条）
      */
-    private fun makeViewBackgroundTranslucent(view: View, alpha: Int) {
+    private fun makeViewTreeTranslucent(view: View, alpha: Int, depth: Int) {
+        if (depth > 4) return
         view.background?.let { bg ->
             val mutated = bg.mutate()
             applyAlphaToDrawable(mutated, alpha)
             view.background = mutated
+        }
+        if (view is ViewGroup) {
+            for (i in 0 until view.childCount) {
+                makeViewTreeTranslucent(view.getChildAt(i), alpha, depth + 1)
+            }
         }
     }
 
