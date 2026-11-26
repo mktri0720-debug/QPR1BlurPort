@@ -1,6 +1,7 @@
 package com.master.qpr1blur
 
 import android.app.Dialog
+import android.content.Context
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.PixelFormat
@@ -27,22 +28,87 @@ class BlurHookEntry : IXposedHookLoadPackage {
     companion object {
         private const val TAG = "[QPR1BlurPort]"
 
-        // 仅作用于音量条/菜单面板本体的高斯模糊半径（像素）
-        private const val PANEL_BLUR_RADIUS_PX = 90
+        // 动态同步的系统原生模糊半径（初始兜底值 150px，注入后会实时更新为系统真实值）
+        @Volatile
+        private var nativeSystemBlurRadiusPx = 150
 
-        // 面板与静音按钮外圈的底色不透明度（0~255）：原版为 255（纯实心）
-        private const val PANEL_BG_ALPHA = 160
+        // 校准后的原生级遮罩不透明度（约 72% 浓度，兼顾动态取色饱和度与毛玻璃通透感）
+        private const val PANEL_BG_ALPHA = 185
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
 
-        XposedBridge.log("$TAG 已注入 SystemUI，启用面板本体与按钮毛玻璃引擎...")
+        XposedBridge.log("$TAG 已注入 SystemUI，开始同步系统原生模糊参数...")
 
+        sniffNativeBlurRadius(lpparam.classLoader)
         hookDialogs()
         hookPopupWindows()
         hookOverlayWindows(lpparam.classLoader)
         hookEmbeddedDropoutViews()
+    }
+
+    /**
+     * 嗅探系统通知栏 BlurUtils 的真实最大模糊半径，确保音量条与系统级模糊程度 1:1 一致
+     */
+    private fun sniffNativeBlurRadius(classLoader: ClassLoader) {
+        val blurUtilsClass = XposedHelpers.findClassIfExists(
+            "com.android.systemui.statusbar.BlurUtils",
+            classLoader
+        )
+        if (blurUtilsClass != null) {
+            // 监听系统通知栏计算模糊半径的过程，直接截取满拉状态下的原生像素值
+            XposedBridge.hookAllMethods(blurUtilsClass, "blurRadiusOfRatio", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val ratio = param.args.firstOrNull() as? Float ?: return
+                    val result = param.result as? Int ?: return
+                    if (ratio >= 0.95f && result > 0 && result != nativeSystemBlurRadiusPx) {
+                        nativeSystemBlurRadiusPx = result
+                        XposedBridge.log("$TAG 已实时同步系统原生满载模糊半径: ${nativeSystemBlurRadiusPx}px")
+                    }
+                }
+            })
+
+            // 监听最终提交给 SurfaceFlinger 的 applyBlur 数值
+            XposedBridge.hookAllMethods(blurUtilsClass, "applyBlur", object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val radius = param.args.getOrNull(1) as? Int ?: return
+                    if (radius > 60 && radius > nativeSystemBlurRadiusPx) {
+                        nativeSystemBlurRadiusPx = radius
+                        XposedBridge.log("$TAG 从 applyBlur 捕获系统最大模糊半径: ${nativeSystemBlurRadiusPx}px")
+                    }
+                }
+            })
+        }
+    }
+
+    /**
+     * 从 Context 资源表中读取系统内置的最大窗口模糊半径作为初始基准
+     */
+    private fun updateRadiusFromContext(context: Context?) {
+        if (context == null) return
+        try {
+            val res = context.resources
+            val resNames = listOf(
+                "max_window_blur_radius",
+                "config_max_window_blur_radius",
+                "notification_shade_blur_radius"
+            )
+            for (name in resNames) {
+                val id = res.getIdentifier(name, "dimen", "com.android.systemui")
+                    .takeIf { it != 0 }
+                    ?: res.getIdentifier(name, "dimen", "android")
+                if (id != 0) {
+                    val px = res.getDimensionPixelSize(id)
+                    if (px > 0 && px != nativeSystemBlurRadiusPx) {
+                        nativeSystemBlurRadiusPx = px
+                        XposedBridge.log("$TAG 从系统资源 ($name) 读取原生模糊半径: ${px}px")
+                        break
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+        }
     }
 
     private fun hookDialogs() {
@@ -53,12 +119,14 @@ class BlurHookEntry : IXposedHookLoadPackage {
                     val className = dialog.javaClass.name
                     val window = dialog.window ?: return
 
+                    updateRadiusFromContext(dialog.context)
+
                     if (isTargetComponent(className)) {
-                        applyPanelOnlyBlur(window, PANEL_BLUR_RADIUS_PX)
+                        applyPanelOnlyBlur(window, nativeSystemBlurRadiusPx)
                         window.decorView.let { decor ->
                             makeContainerTranslucent(decor, PANEL_BG_ALPHA, 0)
                         }
-                        XposedBridge.log("$TAG 面板毛玻璃已注入 Dialog: $className")
+                        XposedBridge.log("$TAG 已注入原生级模糊 (${nativeSystemBlurRadiusPx}px) 至 Dialog: $className")
                     }
                 } catch (t: Throwable) {
                     XposedBridge.log("$TAG Dialog Hook 异常: ${t.message}")
@@ -84,12 +152,13 @@ class BlurHookEntry : IXposedHookLoadPackage {
         if (popup == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
         try {
             val contentView = popup.contentView ?: return
+            updateRadiusFromContext(contentView.context)
             val rootView = contentView.rootView ?: return
             makeContainerTranslucent(contentView, PANEL_BG_ALPHA, 0)
 
             val viewRootImpl = XposedHelpers.callMethod(rootView, "getViewRootImpl")
             if (viewRootImpl != null) {
-                XposedHelpers.callMethod(viewRootImpl, "setBackgroundBlurRadius", PANEL_BLUR_RADIUS_PX)
+                XposedHelpers.callMethod(viewRootImpl, "setBackgroundBlurRadius", nativeSystemBlurRadiusPx)
             }
         } catch (t: Throwable) {
             XposedBridge.log("$TAG PopupWindow Hook 异常: ${t.message}")
@@ -109,6 +178,8 @@ class BlurHookEntry : IXposedHookLoadPackage {
                     val view = param.args[0] as? View ?: return
                     val params = param.args[1] as? WindowManager.LayoutParams ?: return
 
+                    updateRadiusFromContext(view.context)
+
                     val title = params.title?.toString() ?: ""
                     val isTargetWindow = params.type == 2020 ||
                             params.type == 2017 ||
@@ -117,7 +188,6 @@ class BlurHookEntry : IXposedHookLoadPackage {
 
                     if (isTargetWindow && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                         params.format = PixelFormat.TRANSLUCENT
-                        // 彻底清除全屏背景模糊与全屏变暗标志，确保桌面背景 100% 清晰
                         params.flags = params.flags and
                                 WindowManager.LayoutParams.FLAG_BLUR_BEHIND.inv() and
                                 WindowManager.LayoutParams.FLAG_DIM_BEHIND.inv()
@@ -131,13 +201,12 @@ class BlurHookEntry : IXposedHookLoadPackage {
                                         XposedHelpers.callMethod(
                                             viewRootImpl,
                                             "setBackgroundBlurRadius",
-                                            PANEL_BLUR_RADIUS_PX
+                                            nativeSystemBlurRadiusPx
                                         )
                                     }
                                     makeContainerTranslucent(v, PANEL_BG_ALPHA, 0)
-                                    // 延迟一帧再次处理异步加载的静音按钮背景
                                     v.post { makeContainerTranslucent(v, PANEL_BG_ALPHA, 0) }
-                                    XposedBridge.log("$TAG 音量条本体及按钮毛玻璃已注入: $title")
+                                    XposedBridge.log("$TAG 悬浮面板已应用原生级模糊 (${nativeSystemBlurRadiusPx}px): $title")
                                 } catch (e: Throwable) {
                                     XposedBridge.log("$TAG 悬浮窗口模糊异常: ${e.message}")
                                 }
@@ -192,9 +261,6 @@ class BlurHookEntry : IXposedHookLoadPackage {
         }
     }
 
-    /**
-     * 递归穿透背景 Drawable（含 RippleDrawable 水波纹按钮底色）与 Tint 着色层，跳过音量滑块进度条
-     */
     private fun makeContainerTranslucent(view: View, alpha: Int, depth: Int) {
         if (depth > 8 || view is SeekBar) return
 
