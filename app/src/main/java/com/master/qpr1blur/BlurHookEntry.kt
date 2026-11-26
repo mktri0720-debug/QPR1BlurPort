@@ -13,6 +13,7 @@ import android.graphics.drawable.RippleDrawable
 import android.os.Build
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewTreeObserver
 import android.view.Window
 import android.view.WindowManager
 import android.widget.PopupWindow
@@ -22,26 +23,33 @@ import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import java.util.Collections
+import java.util.WeakHashMap
 
 class BlurHookEntry : IXposedHookLoadPackage {
 
     companion object {
         private const val TAG = "[QPR1BlurPort]"
 
-        // 动态同步的系统原生模糊半径（初始兜底值 150px，注入后会实时更新为系统真实值）
+        // 动态同步的系统原生模糊半径（初始兜底 150px，注入后自动对齐通知栏原生最大值）
         @Volatile
         private var nativeSystemBlurRadiusPx = 150
 
-        // 校准后的原生级遮罩不透明度（约 72% 浓度，兼顾动态取色饱和度与毛玻璃通透感）
+        // 面板与静音按钮外圈的底色不透明度（0~255）：约 72% 浓度，兼具动态取色饱和度与毛玻璃通透感
         private const val PANEL_BG_ALPHA = 185
+
+        // 弱引用追踪已纳入毛玻璃管理的视图树，从源头杜绝后续重绘恢复实心底色
+        private val trackedViews: MutableSet<View> =
+            Collections.newSetFromMap(WeakHashMap())
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
 
-        XposedBridge.log("$TAG 已注入 SystemUI，开始同步系统原生模糊参数...")
+        XposedBridge.log("$TAG 已注入 SystemUI，启用首帧零延迟原生级毛玻璃引擎...")
 
         sniffNativeBlurRadius(lpparam.classLoader)
+        hookBackgroundSetters()
         hookDialogs()
         hookPopupWindows()
         hookOverlayWindows(lpparam.classLoader)
@@ -49,7 +57,58 @@ class BlurHookEntry : IXposedHookLoadPackage {
     }
 
     /**
-     * 嗅探系统通知栏 BlurUtils 的真实最大模糊半径，确保音量条与系统级模糊程度 1:1 一致
+     * 核心防闪烁：在 View 设置背景和 Tint 的源头直接拦截，杜绝首帧出现实心底色
+     */
+    private fun hookBackgroundSetters() {
+        XposedBridge.hookAllMethods(View::class.java, "setBackgroundDrawable", object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                val view = param.thisObject as? View ?: return
+                if (!isTrackedOrInsideTarget(view)) return
+                val drawable = param.args.firstOrNull() as? Drawable ?: return
+                val mutated = drawable.mutate()
+                applyAlphaToDrawable(mutated, PANEL_BG_ALPHA)
+                param.args[0] = mutated
+            }
+        })
+
+        XposedBridge.hookAllMethods(View::class.java, "setBackgroundTintList", object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                val view = param.thisObject as? View ?: return
+                if (!isTrackedOrInsideTarget(view)) return
+                val tintList = param.args.firstOrNull() as? ColorStateList ?: return
+                val defaultColor = tintList.defaultColor
+                if (Color.alpha(defaultColor) > PANEL_BG_ALPHA) {
+                    param.args[0] = ColorStateList.valueOf(
+                        Color.argb(
+                            PANEL_BG_ALPHA,
+                            Color.red(defaultColor),
+                            Color.green(defaultColor),
+                            Color.blue(defaultColor)
+                        )
+                    )
+                }
+            }
+        })
+    }
+
+    private fun isTrackedOrInsideTarget(view: View): Boolean {
+        if (view is SeekBar) return false
+        if (trackedViews.contains(view)) return true
+        var p = view.parent
+        var depth = 0
+        while (p is View && depth < 8) {
+            if (trackedViews.contains(p)) {
+                trackedViews.add(view)
+                return true
+            }
+            p = p.parent
+            depth++
+        }
+        return false
+    }
+
+    /**
+     * 实时嗅探系统通知栏 BlurUtils 的最大模糊像素值，保证与系统原生模糊颗粒度 1:1 一致
      */
     private fun sniffNativeBlurRadius(classLoader: ClassLoader) {
         val blurUtilsClass = XposedHelpers.findClassIfExists(
@@ -57,34 +116,29 @@ class BlurHookEntry : IXposedHookLoadPackage {
             classLoader
         )
         if (blurUtilsClass != null) {
-            // 监听系统通知栏计算模糊半径的过程，直接截取满拉状态下的原生像素值
             XposedBridge.hookAllMethods(blurUtilsClass, "blurRadiusOfRatio", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val ratio = param.args.firstOrNull() as? Float ?: return
                     val result = param.result as? Int ?: return
                     if (ratio >= 0.95f && result > 0 && result != nativeSystemBlurRadiusPx) {
                         nativeSystemBlurRadiusPx = result
-                        XposedBridge.log("$TAG 已实时同步系统原生满载模糊半径: ${nativeSystemBlurRadiusPx}px")
+                        XposedBridge.log("$TAG 已同步系统原生满载模糊半径: ${nativeSystemBlurRadiusPx}px")
                     }
                 }
             })
 
-            // 监听最终提交给 SurfaceFlinger 的 applyBlur 数值
             XposedBridge.hookAllMethods(blurUtilsClass, "applyBlur", object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val radius = param.args.getOrNull(1) as? Int ?: return
                     if (radius > 60 && radius > nativeSystemBlurRadiusPx) {
                         nativeSystemBlurRadiusPx = radius
-                        XposedBridge.log("$TAG 从 applyBlur 捕获系统最大模糊半径: ${nativeSystemBlurRadiusPx}px")
+                        XposedBridge.log("$TAG 已捕获系统最大模糊半径: ${nativeSystemBlurRadiusPx}px")
                     }
                 }
             })
         }
     }
 
-    /**
-     * 从 Context 资源表中读取系统内置的最大窗口模糊半径作为初始基准
-     */
     private fun updateRadiusFromContext(context: Context?) {
         if (context == null) return
         try {
@@ -100,9 +154,8 @@ class BlurHookEntry : IXposedHookLoadPackage {
                     ?: res.getIdentifier(name, "dimen", "android")
                 if (id != 0) {
                     val px = res.getDimensionPixelSize(id)
-                    if (px > 0 && px != nativeSystemBlurRadiusPx) {
+                    if (px > 0) {
                         nativeSystemBlurRadiusPx = px
-                        XposedBridge.log("$TAG 从系统资源 ($name) 读取原生模糊半径: ${px}px")
                         break
                     }
                 }
@@ -112,37 +165,44 @@ class BlurHookEntry : IXposedHookLoadPackage {
     }
 
     private fun hookDialogs() {
-        XposedBridge.hookAllMethods(Dialog::class.java, "onStart", object : XC_MethodHook() {
+        XposedBridge.hookAllMethods(Dialog::class.java, "onCreate", object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
-                try {
-                    val dialog = param.thisObject as? Dialog ?: return
-                    val className = dialog.javaClass.name
-                    val window = dialog.window ?: return
-
-                    updateRadiusFromContext(dialog.context)
-
-                    if (isTargetComponent(className)) {
-                        applyPanelOnlyBlur(window, nativeSystemBlurRadiusPx)
-                        window.decorView.let { decor ->
-                            makeContainerTranslucent(decor, PANEL_BG_ALPHA, 0)
-                        }
-                        XposedBridge.log("$TAG 已注入原生级模糊 (${nativeSystemBlurRadiusPx}px) 至 Dialog: $className")
-                    }
-                } catch (t: Throwable) {
-                    XposedBridge.log("$TAG Dialog Hook 异常: ${t.message}")
-                }
+                prepareDialogBlur(param.thisObject as? Dialog)
+            }
+        })
+        XposedBridge.hookAllMethods(Dialog::class.java, "onStart", object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                prepareDialogBlur(param.thisObject as? Dialog)
             }
         })
     }
 
+    private fun prepareDialogBlur(dialog: Dialog?) {
+        if (dialog == null) return
+        try {
+            val className = dialog.javaClass.name
+            val window = dialog.window ?: return
+            updateRadiusFromContext(dialog.context)
+
+            if (isTargetComponent(className)) {
+                applyPanelOnlyBlur(window, nativeSystemBlurRadiusPx)
+                val decor = window.decorView
+                markTreeTracked(decor, 0)
+                makeContainerTranslucent(decor, PANEL_BG_ALPHA, 0)
+                XposedBridge.log("$TAG 已为 Dialog 注入零延迟模糊 (${nativeSystemBlurRadiusPx}px): $className")
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
     private fun hookPopupWindows() {
         XposedBridge.hookAllMethods(PopupWindow::class.java, "showAtLocation", object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
+            override fun beforeHookedMethod(param: MethodHookParam) {
                 handlePopupWindow(param.thisObject as? PopupWindow)
             }
         })
         XposedBridge.hookAllMethods(PopupWindow::class.java, "showAsDropDown", object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
+            override fun beforeHookedMethod(param: MethodHookParam) {
                 handlePopupWindow(param.thisObject as? PopupWindow)
             }
         })
@@ -153,15 +213,15 @@ class BlurHookEntry : IXposedHookLoadPackage {
         try {
             val contentView = popup.contentView ?: return
             updateRadiusFromContext(contentView.context)
-            val rootView = contentView.rootView ?: return
+            markTreeTracked(contentView, 0)
             makeContainerTranslucent(contentView, PANEL_BG_ALPHA, 0)
 
+            val rootView = contentView.rootView ?: return
             val viewRootImpl = XposedHelpers.callMethod(rootView, "getViewRootImpl")
             if (viewRootImpl != null) {
                 XposedHelpers.callMethod(viewRootImpl, "setBackgroundBlurRadius", nativeSystemBlurRadiusPx)
             }
-        } catch (t: Throwable) {
-            XposedBridge.log("$TAG PopupWindow Hook 异常: ${t.message}")
+        } catch (_: Throwable) {
         }
     }
 
@@ -193,10 +253,15 @@ class BlurHookEntry : IXposedHookLoadPackage {
                                 WindowManager.LayoutParams.FLAG_DIM_BEHIND.inv()
                         params.blurBehindRadius = 0
 
-                        view.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
-                            override fun onViewAttachedToWindow(v: View) {
+                        // 1. 立即同步标记并剥离实心底色
+                        markTreeTracked(view, 0)
+                        makeContainerTranslucent(view, PANEL_BG_ALPHA, 0)
+
+                        // 2. 在首帧光栅化提交（onPreDraw）前同步写入模糊半径，消除首帧跳变
+                        view.viewTreeObserver.addOnPreDrawListener(object : ViewTreeObserver.OnPreDrawListener {
+                            override fun onPreDraw(): Boolean {
                                 try {
-                                    val viewRootImpl = XposedHelpers.callMethod(v, "getViewRootImpl")
+                                    val viewRootImpl = XposedHelpers.callMethod(view, "getViewRootImpl")
                                     if (viewRootImpl != null) {
                                         XposedHelpers.callMethod(
                                             viewRootImpl,
@@ -204,15 +269,15 @@ class BlurHookEntry : IXposedHookLoadPackage {
                                             nativeSystemBlurRadiusPx
                                         )
                                     }
-                                    makeContainerTranslucent(v, PANEL_BG_ALPHA, 0)
-                                    v.post { makeContainerTranslucent(v, PANEL_BG_ALPHA, 0) }
-                                    XposedBridge.log("$TAG 悬浮面板已应用原生级模糊 (${nativeSystemBlurRadiusPx}px): $title")
-                                } catch (e: Throwable) {
-                                    XposedBridge.log("$TAG 悬浮窗口模糊异常: ${e.message}")
+                                    makeContainerTranslucent(view, PANEL_BG_ALPHA, 0)
+                                } catch (_: Throwable) {
+                                } finally {
+                                    if (view.viewTreeObserver.isAlive) {
+                                        view.viewTreeObserver.removeOnPreDrawListener(this)
+                                    }
                                 }
+                                return true
                             }
-
-                            override fun onViewDetachedFromWindow(v: View) {}
                         })
                     }
                 } catch (t: Throwable) {
@@ -224,20 +289,34 @@ class BlurHookEntry : IXposedHookLoadPackage {
 
     private fun hookEmbeddedDropoutViews() {
         XposedBridge.hookAllMethods(ViewGroup::class.java, "addView", object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
+            override fun beforeHookedMethod(param: MethodHookParam) {
                 try {
+                    val parent = param.thisObject as? View ?: return
                     val child = param.args.firstOrNull() as? View ?: return
                     val name = child.javaClass.name
-                    if (name.contains("QSDetail", ignoreCase = true) ||
+
+                    if (trackedViews.contains(parent) ||
+                        name.contains("QSDetail", ignoreCase = true) ||
                         name.contains("Dropdown", ignoreCase = true) ||
                         name.contains("PopupMenu", ignoreCase = true)
                     ) {
+                        markTreeTracked(child, 0)
                         makeContainerTranslucent(child, PANEL_BG_ALPHA, 0)
                     }
                 } catch (_: Throwable) {
                 }
             }
         })
+    }
+
+    private fun markTreeTracked(view: View, depth: Int) {
+        if (depth > 8 || view is SeekBar) return
+        trackedViews.add(view)
+        if (view is ViewGroup) {
+            for (i in 0 until view.childCount) {
+                markTreeTracked(view.getChildAt(i), depth + 1)
+            }
+        }
     }
 
     private fun isTargetComponent(name: String): Boolean {
@@ -266,13 +345,16 @@ class BlurHookEntry : IXposedHookLoadPackage {
 
         view.backgroundTintList?.let { tintList ->
             val defaultColor = tintList.defaultColor
-            val translucentColor = Color.argb(
-                alpha,
-                Color.red(defaultColor),
-                Color.green(defaultColor),
-                Color.blue(defaultColor)
-            )
-            view.backgroundTintList = ColorStateList.valueOf(translucentColor)
+            if (Color.alpha(defaultColor) > alpha) {
+                view.backgroundTintList = ColorStateList.valueOf(
+                    Color.argb(
+                        alpha,
+                        Color.red(defaultColor),
+                        Color.green(defaultColor),
+                        Color.blue(defaultColor)
+                    )
+                )
+            }
         }
 
         view.background?.let { bg ->
@@ -304,14 +386,18 @@ class BlurHookEntry : IXposedHookLoadPackage {
                 drawable.alpha = alpha
                 drawable.color?.let { csl ->
                     val c = csl.defaultColor
-                    drawable.color = ColorStateList.valueOf(
-                        Color.argb(alpha, Color.red(c), Color.green(c), Color.blue(c))
-                    )
+                    if (Color.alpha(c) > alpha) {
+                        drawable.color = ColorStateList.valueOf(
+                            Color.argb(alpha, Color.red(c), Color.green(c), Color.blue(c))
+                        )
+                    }
                 }
             }
             is ColorDrawable -> {
                 val c = drawable.color
-                drawable.color = Color.argb(alpha, Color.red(c), Color.green(c), Color.blue(c))
+                if (Color.alpha(c) > alpha) {
+                    drawable.color = Color.argb(alpha, Color.red(c), Color.green(c), Color.blue(c))
+                }
             }
             else -> {
                 drawable.alpha = alpha
