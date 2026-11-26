@@ -1,21 +1,27 @@
 package com.master.qpr1blur
 
+import android.animation.ValueAnimator
 import android.app.Dialog
 import android.content.Context
 import android.content.res.ColorStateList
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.PixelFormat
+import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
+import android.graphics.drawable.DrawableWrapper
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.LayerDrawable
 import android.graphics.drawable.RippleDrawable
 import android.os.Build
 import android.view.View
 import android.view.ViewGroup
-import android.view.ViewTreeObserver
 import android.view.Window
 import android.view.WindowManager
+import android.view.animation.DecelerateInterpolator
 import android.widget.PopupWindow
 import android.widget.SeekBar
 import de.robv.android.xposed.IXposedHookLoadPackage
@@ -31,198 +37,161 @@ class BlurHookEntry : IXposedHookLoadPackage {
     companion object {
         private const val TAG = "[QPR1BlurPort]"
 
-        // 动态同步的系统原生模糊半径（初始兜底 150px，注入后自动对齐通知栏原生最大值）
+        // 目标高斯模糊半径（像素）：自动同步系统原生值，兜底 110px
         @Volatile
-        private var nativeSystemBlurRadiusPx = 150
+        private var targetBlurRadiusPx = 110
 
-        // 面板与静音按钮外圈的底色不透明度（0~255）：约 72% 浓度，兼具动态取色饱和度与毛玻璃通透感
-        private const val PANEL_BG_ALPHA = 185
+        // 卡片与音量大面板底色不透明度（0~255）：推荐 165 ~ 185
+        private const val PANEL_BG_ALPHA = 170
 
-        // 弱引用追踪已纳入毛玻璃管理的视图树，从源头杜绝后续重绘恢复实心底色
-        private val trackedViews: MutableSet<View> =
+        // 渐进模糊动画时长（毫秒）
+        private const val BLUR_ANIM_DURATION_MS = 220L
+
+        private const val TAG_BLUR_ATTACHED = 0x51505231
+
+        // 追踪目标弹窗内的 ComposeView，供画布拦截器识别底板
+        private val trackedComposeViews: MutableSet<View> =
             Collections.newSetFromMap(WeakHashMap())
+
+        private val activeComposeWidth = ThreadLocal<Float>()
+        private val activeComposeHeight = ThreadLocal<Float>()
+        private val savedPaintAlpha = ThreadLocal<Int>()
+        private val tempBounds = ThreadLocal<RectF>()
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
 
-        XposedBridge.log("$TAG 已注入 SystemUI，启用首帧零延迟原生级毛玻璃引擎...")
+        XposedBridge.log("$TAG 已注入 SystemUI，启用全系原生 BackgroundBlurDrawable + Compose 穿透引擎...")
 
         sniffNativeBlurRadius(lpparam.classLoader)
-        hookBackgroundSetters()
+        hookComposeSurfaceTransparency()
         hookDialogs()
         hookPopupWindows()
         hookOverlayWindows(lpparam.classLoader)
-        hookEmbeddedDropoutViews()
     }
 
     /**
-     * 核心防闪烁：在 View 设置背景和 Tint 的源头直接拦截，杜绝首帧出现实心底色
+     * 专治 Jetpack Compose 展开音量大面板：仅在目标 ComposeView 绘制底板大圆角时降低画笔不透明度
      */
-    private fun hookBackgroundSetters() {
-        XposedBridge.hookAllMethods(View::class.java, "setBackgroundDrawable", object : XC_MethodHook() {
+    private fun hookComposeSurfaceTransparency() {
+        XposedBridge.hookAllMethods(ViewGroup::class.java, "dispatchDraw", object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 val view = param.thisObject as? View ?: return
-                if (!isTrackedOrInsideTarget(view)) return
-                val drawable = param.args.firstOrNull() as? Drawable ?: return
-                val mutated = drawable.mutate()
-                applyAlphaToDrawable(mutated, PANEL_BG_ALPHA)
-                param.args[0] = mutated
+                if (trackedComposeViews.contains(view)) {
+                    activeComposeWidth.set(view.width.toFloat())
+                    activeComposeHeight.set(view.height.toFloat())
+                }
             }
-        })
 
-        XposedBridge.hookAllMethods(View::class.java, "setBackgroundTintList", object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                val view = param.thisObject as? View ?: return
-                if (!isTrackedOrInsideTarget(view)) return
-                val tintList = param.args.firstOrNull() as? ColorStateList ?: return
-                val defaultColor = tintList.defaultColor
-                if (Color.alpha(defaultColor) > PANEL_BG_ALPHA) {
-                    param.args[0] = ColorStateList.valueOf(
-                        Color.argb(
-                            PANEL_BG_ALPHA,
-                            Color.red(defaultColor),
-                            Color.green(defaultColor),
-                            Color.blue(defaultColor)
-                        )
-                    )
+            override fun afterHookedMethod(param: MethodHookParam) {
+                if (activeComposeWidth.get() != null) {
+                    activeComposeWidth.remove()
+                    activeComposeHeight.remove()
                 }
             }
         })
-    }
 
-    private fun isTrackedOrInsideTarget(view: View): Boolean {
-        if (view is SeekBar) return false
-        if (trackedViews.contains(view)) return true
-        var p = view.parent
-        var depth = 0
-        while (p is View && depth < 8) {
-            if (trackedViews.contains(p)) {
-                trackedViews.add(view)
-                return true
+        val baseCanvasClass = XposedHelpers.findClassIfExists(
+            "android.graphics.BaseRecordingCanvas",
+            null
+        ) ?: return
+
+        val canvasDrawHook = object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                val w = activeComposeWidth.get() ?: return
+                val h = activeComposeHeight.get() ?: return
+                if (w <= 0f || h <= 0f) return
+
+                val paint = param.args.lastOrNull() as? Paint ?: return
+                if (paint.style == Paint.Style.STROKE || paint.alpha <= PANEL_BG_ALPHA) return
+
+                val isLargeBg = when (param.method.name) {
+                    "drawPath" -> {
+                        val path = param.args.firstOrNull() as? Path ?: return
+                        val rect = tempBounds.get() ?: RectF().also { tempBounds.set(it) }
+                        path.computeBounds(rect, true)
+                        rect.width() >= w * 0.85f && rect.height() >= h * 0.55f
+                    }
+                    "drawRoundRect", "drawRect" -> {
+                        if (param.args.size >= 5 && param.args[0] is Float) {
+                            val left = param.args[0] as Float
+                            val top = param.args[1] as Float
+                            val right = param.args[2] as Float
+                            val bottom = param.args[3] as Float
+                            (right - left) >= w * 0.85f && (bottom - top) >= h * 0.55f
+                        } else if (param.args.firstOrNull() is RectF) {
+                            val r = param.args[0] as RectF
+                            r.width() >= w * 0.85f && r.height() >= h * 0.55f
+                        } else {
+                            false
+                        }
+                    }
+                    else -> false
+                }
+
+                if (isLargeBg) {
+                    savedPaintAlpha.set(paint.alpha)
+                    paint.alpha = PANEL_BG_ALPHA
+                }
             }
-            p = p.parent
-            depth++
+
+            override fun afterHookedMethod(param: MethodHookParam) {
+                val origAlpha = savedPaintAlpha.get() ?: return
+                savedPaintAlpha.remove()
+                val paint = param.args.lastOrNull() as? Paint ?: return
+                paint.alpha = origAlpha
+            }
         }
-        return false
+
+        XposedBridge.hookAllMethods(baseCanvasClass, "drawPath", canvasDrawHook)
+        XposedBridge.hookAllMethods(baseCanvasClass, "drawRoundRect", canvasDrawHook)
+        XposedBridge.hookAllMethods(baseCanvasClass, "drawRect", canvasDrawHook)
     }
 
-    /**
-     * 实时嗅探系统通知栏 BlurUtils 的最大模糊像素值，保证与系统原生模糊颗粒度 1:1 一致
-     */
     private fun sniffNativeBlurRadius(classLoader: ClassLoader) {
         val blurUtilsClass = XposedHelpers.findClassIfExists(
             "com.android.systemui.statusbar.BlurUtils",
             classLoader
-        )
-        if (blurUtilsClass != null) {
-            XposedBridge.hookAllMethods(blurUtilsClass, "blurRadiusOfRatio", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val ratio = param.args.firstOrNull() as? Float ?: return
-                    val result = param.result as? Int ?: return
-                    if (ratio >= 0.95f && result > 0 && result != nativeSystemBlurRadiusPx) {
-                        nativeSystemBlurRadiusPx = result
-                        XposedBridge.log("$TAG 已同步系统原生满载模糊半径: ${nativeSystemBlurRadiusPx}px")
-                    }
-                }
-            })
+        ) ?: return
 
-            XposedBridge.hookAllMethods(blurUtilsClass, "applyBlur", object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val radius = param.args.getOrNull(1) as? Int ?: return
-                    if (radius > 60 && radius > nativeSystemBlurRadiusPx) {
-                        nativeSystemBlurRadiusPx = radius
-                        XposedBridge.log("$TAG 已捕获系统最大模糊半径: ${nativeSystemBlurRadiusPx}px")
-                    }
-                }
-            })
-        }
-    }
-
-    private fun updateRadiusFromContext(context: Context?) {
-        if (context == null) return
-        try {
-            val res = context.resources
-            val resNames = listOf(
-                "max_window_blur_radius",
-                "config_max_window_blur_radius",
-                "notification_shade_blur_radius"
-            )
-            for (name in resNames) {
-                val id = res.getIdentifier(name, "dimen", "com.android.systemui")
-                    .takeIf { it != 0 }
-                    ?: res.getIdentifier(name, "dimen", "android")
-                if (id != 0) {
-                    val px = res.getDimensionPixelSize(id)
-                    if (px > 0) {
-                        nativeSystemBlurRadiusPx = px
-                        break
-                    }
+        XposedBridge.hookAllMethods(blurUtilsClass, "blurRadiusOfRatio", object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                val ratio = param.args.firstOrNull() as? Float ?: return
+                val result = param.result as? Int ?: return
+                if (ratio >= 0.95f && result in 40..250 && result != targetBlurRadiusPx) {
+                    targetBlurRadiusPx = result
+                    XposedBridge.log("$TAG 已同步系统原生模糊半径: ${targetBlurRadiusPx}px")
                 }
             }
-        } catch (_: Throwable) {
-        }
+        })
     }
 
     private fun hookDialogs() {
-        XposedBridge.hookAllMethods(Dialog::class.java, "onCreate", object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                prepareDialogBlur(param.thisObject as? Dialog)
-            }
-        })
         XposedBridge.hookAllMethods(Dialog::class.java, "onStart", object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                prepareDialogBlur(param.thisObject as? Dialog)
+            override fun afterHookedMethod(param: MethodHookParam) {
+                val dialog = param.thisObject as? Dialog ?: return
+                val className = dialog.javaClass.name
+                val window = dialog.window ?: return
+                if (!isTargetComponent(className)) return
+
+                prepareWindowFormat(window)
+                val decor = window.decorView
+                attachBlurWhenReady(decor, isDialog = true, label = className)
             }
         })
-    }
-
-    private fun prepareDialogBlur(dialog: Dialog?) {
-        if (dialog == null) return
-        try {
-            val className = dialog.javaClass.name
-            val window = dialog.window ?: return
-            updateRadiusFromContext(dialog.context)
-
-            if (isTargetComponent(className)) {
-                applyPanelOnlyBlur(window, nativeSystemBlurRadiusPx)
-                val decor = window.decorView
-                markTreeTracked(decor, 0)
-                makeContainerTranslucent(decor, PANEL_BG_ALPHA, 0)
-                XposedBridge.log("$TAG 已为 Dialog 注入零延迟模糊 (${nativeSystemBlurRadiusPx}px): $className")
-            }
-        } catch (_: Throwable) {
-        }
     }
 
     private fun hookPopupWindows() {
-        XposedBridge.hookAllMethods(PopupWindow::class.java, "showAtLocation", object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                handlePopupWindow(param.thisObject as? PopupWindow)
+        val hook = object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                val popup = param.thisObject as? PopupWindow ?: return
+                val content = popup.contentView ?: return
+                attachBlurWhenReady(content, isDialog = false, label = "PopupWindow")
             }
-        })
-        XposedBridge.hookAllMethods(PopupWindow::class.java, "showAsDropDown", object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                handlePopupWindow(param.thisObject as? PopupWindow)
-            }
-        })
-    }
-
-    private fun handlePopupWindow(popup: PopupWindow?) {
-        if (popup == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
-        try {
-            val contentView = popup.contentView ?: return
-            updateRadiusFromContext(contentView.context)
-            markTreeTracked(contentView, 0)
-            makeContainerTranslucent(contentView, PANEL_BG_ALPHA, 0)
-
-            val rootView = contentView.rootView ?: return
-            val viewRootImpl = XposedHelpers.callMethod(rootView, "getViewRootImpl")
-            if (viewRootImpl != null) {
-                XposedHelpers.callMethod(viewRootImpl, "setBackgroundBlurRadius", nativeSystemBlurRadiusPx)
-            }
-        } catch (_: Throwable) {
         }
+        XposedBridge.hookAllMethods(PopupWindow::class.java, "showAtLocation", hook)
+        XposedBridge.hookAllMethods(PopupWindow::class.java, "showAsDropDown", hook)
     }
 
     private fun hookOverlayWindows(classLoader: ClassLoader) {
@@ -233,144 +202,221 @@ class BlurHookEntry : IXposedHookLoadPackage {
 
         XposedBridge.hookAllMethods(wmgClass, "addView", object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
-                try {
-                    if (param.args.size < 2) return
-                    val view = param.args[0] as? View ?: return
-                    val params = param.args[1] as? WindowManager.LayoutParams ?: return
+                if (param.args.size < 2) return
+                val view = param.args[0] as? View ?: return
+                val params = param.args[1] as? WindowManager.LayoutParams ?: return
+                val title = params.title?.toString() ?: ""
 
-                    updateRadiusFromContext(view.context)
+                val isTargetWindow = params.type == 2020 ||
+                        params.type == 2017 ||
+                        params.type == 2008 ||
+                        isTargetComponent(title)
 
-                    val title = params.title?.toString() ?: ""
-                    val isTargetWindow = params.type == 2020 ||
-                            params.type == 2017 ||
-                            params.type == 2008 ||
-                            isTargetComponent(title)
+                if (isTargetWindow && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    params.format = PixelFormat.TRANSLUCENT
+                    params.flags = params.flags and
+                            WindowManager.LayoutParams.FLAG_BLUR_BEHIND.inv() and
+                            WindowManager.LayoutParams.FLAG_DIM_BEHIND.inv()
+                    params.blurBehindRadius = 0
 
-                    if (isTargetWindow && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                        params.format = PixelFormat.TRANSLUCENT
-                        params.flags = params.flags and
-                                WindowManager.LayoutParams.FLAG_BLUR_BEHIND.inv() and
-                                WindowManager.LayoutParams.FLAG_DIM_BEHIND.inv()
-                        params.blurBehindRadius = 0
-
-                        // 1. 立即同步标记并剥离实心底色
-                        markTreeTracked(view, 0)
-                        makeContainerTranslucent(view, PANEL_BG_ALPHA, 0)
-
-                        // 2. 在首帧光栅化提交（onPreDraw）前同步写入模糊半径，消除首帧跳变
-                        view.viewTreeObserver.addOnPreDrawListener(object : ViewTreeObserver.OnPreDrawListener {
-                            override fun onPreDraw(): Boolean {
-                                try {
-                                    val viewRootImpl = XposedHelpers.callMethod(view, "getViewRootImpl")
-                                    if (viewRootImpl != null) {
-                                        XposedHelpers.callMethod(
-                                            viewRootImpl,
-                                            "setBackgroundBlurRadius",
-                                            nativeSystemBlurRadiusPx
-                                        )
-                                    }
-                                    makeContainerTranslucent(view, PANEL_BG_ALPHA, 0)
-                                } catch (_: Throwable) {
-                                } finally {
-                                    if (view.viewTreeObserver.isAlive) {
-                                        view.viewTreeObserver.removeOnPreDrawListener(this)
-                                    }
-                                }
-                                return true
-                            }
-                        })
-                    }
-                } catch (t: Throwable) {
-                    XposedBridge.log("$TAG WindowManagerGlobal 异常: ${t.message}")
+                    attachBlurWhenReady(view, isDialog = false, label = title)
                 }
             }
         })
     }
 
-    private fun hookEmbeddedDropoutViews() {
-        XposedBridge.hookAllMethods(ViewGroup::class.java, "addView", object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                try {
-                    val parent = param.thisObject as? View ?: return
-                    val child = param.args.firstOrNull() as? View ?: return
-                    val name = child.javaClass.name
-
-                    if (trackedViews.contains(parent) ||
-                        name.contains("QSDetail", ignoreCase = true) ||
-                        name.contains("Dropdown", ignoreCase = true) ||
-                        name.contains("PopupMenu", ignoreCase = true)
-                    ) {
-                        markTreeTracked(child, 0)
-                        makeContainerTranslucent(child, PANEL_BG_ALPHA, 0)
-                    }
-                } catch (_: Throwable) {
-                }
-            }
-        })
-    }
-
-    private fun markTreeTracked(view: View, depth: Int) {
-        if (depth > 8 || view is SeekBar) return
-        trackedViews.add(view)
-        if (view is ViewGroup) {
-            for (i in 0 until view.childCount) {
-                markTreeTracked(view.getChildAt(i), depth + 1)
-            }
-        }
-    }
-
-    private fun isTargetComponent(name: String): Boolean {
-        return name.contains("Volume", ignoreCase = true) ||
-                name.contains("SystemUIDialog", ignoreCase = true) ||
-                name.contains("QS", ignoreCase = true) ||
-                name.contains("Detail", ignoreCase = true) ||
-                name.contains("Menu", ignoreCase = true) ||
-                name.contains("Media", ignoreCase = true) ||
-                name.contains("Output", ignoreCase = true) ||
-                name.contains("Popup", ignoreCase = true)
-    }
-
-    private fun applyPanelOnlyBlur(window: Window, radiusPx: Int) {
+    private fun prepareWindowFormat(window: Window) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             window.setFormat(PixelFormat.TRANSLUCENT)
             window.clearFlags(WindowManager.LayoutParams.FLAG_BLUR_BEHIND)
-            window.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
             window.attributes = window.attributes.apply { blurBehindRadius = 0 }
-            window.setBackgroundBlurRadius(radiusPx)
         }
     }
 
-    private fun makeContainerTranslucent(view: View, alpha: Int, depth: Int) {
-        if (depth > 8 || view is SeekBar) return
+    private fun attachBlurWhenReady(root: View, isDialog: Boolean, label: String) {
+        val applyTask = Runnable {
+            try {
+                val viewRootImpl = XposedHelpers.callMethod(root, "getViewRootImpl")
+                if (viewRootImpl == null) {
+                    XposedBridge.log("$TAG 未获取到 ViewRootImpl，跳过: $label")
+                    return@Runnable
+                }
 
-        view.backgroundTintList?.let { tintList ->
-            val defaultColor = tintList.defaultColor
-            if (Color.alpha(defaultColor) > alpha) {
-                view.backgroundTintList = ColorStateList.valueOf(
-                    Color.argb(
-                        alpha,
-                        Color.red(defaultColor),
-                        Color.green(defaultColor),
-                        Color.blue(defaultColor)
-                    )
+                // 1. 扫描并标记内部所有 ComposeView（展开音量大面板）
+                val composeViews = mutableListOf<View>()
+                findComposeViews(root, composeViews, 0)
+                for (cv in composeViews) {
+                    trackedComposeViews.add(cv)
+                    cv.invalidate()
+                }
+
+                // 2. 找出带有圆角背景的传统卡片容器
+                val targetViews = mutableListOf<View>()
+                findBackgroundContainers(root, targetViews, 0)
+
+                // 如果找不到传统背景但存在 ComposeView，直接将模糊层贴到 ComposeView 上
+                if (targetViews.isEmpty() && composeViews.isNotEmpty()) {
+                    targetViews.addAll(composeViews)
+                } else if (targetViews.isEmpty()) {
+                    targetViews.add(root)
+                }
+
+                val isBottomSheet = label.contains("Volume", ignoreCase = true) ||
+                        label.contains("Sheet", ignoreCase = true) ||
+                        composeViews.isNotEmpty()
+                val defaultCornerPx = dpToPx(root.context, if (isDialog) 28f else 26f)
+
+                for (card in targetViews) {
+                    applyHardwareBlurDrawable(card, viewRootImpl, defaultCornerPx, isBottomSheet && isDialog)
+                }
+                XposedBridge.log(
+                    "$TAG 原生模糊挂载成功 (容器=${targetViews.size}, Compose=${composeViews.size}, ${targetBlurRadiusPx}px): $label"
                 )
+            } catch (t: Throwable) {
+                XposedBridge.log("$TAG 挂载模糊异常 ($label): ${t.message}")
             }
         }
 
-        view.background?.let { bg ->
-            val mutated = bg.mutate()
-            applyAlphaToDrawable(mutated, alpha)
-            view.background = mutated
+        if (root.isAttachedToWindow) {
+            root.post(applyTask)
+        } else {
+            root.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(v: View) {
+                    v.removeOnAttachStateChangeListener(this)
+                    v.post(applyTask)
+                }
+                override fun onViewDetachedFromWindow(v: View) {}
+            })
+        }
+    }
+
+    private fun applyHardwareBlurDrawable(
+        view: View,
+        viewRootImpl: Any,
+        fallbackCornerPx: Float,
+        bottomSheetCorners: Boolean
+    ) {
+        if (view.getTag(TAG_BLUR_ATTACHED) == true) return
+        view.setTag(TAG_BLUR_ATTACHED, true)
+
+        val blurDrawable = XposedHelpers.callMethod(
+            viewRootImpl,
+            "createBackgroundBlurDrawable"
+        ) as? Drawable ?: return
+
+        val cornerPx = extractCornerRadius(view.background) ?: fallbackCornerPx
+        try {
+            if (bottomSheetCorners) {
+                // 底部抽屉仅顶部两角圆角，底部贴边为直角
+                XposedHelpers.callMethod(
+                    blurDrawable,
+                    "setCornerRadius",
+                    cornerPx, cornerPx, 0f, 0f
+                )
+            } else {
+                XposedHelpers.callMethod(blurDrawable, "setCornerRadius", cornerPx)
+            }
+        } catch (_: Throwable) {
+            XposedHelpers.callMethod(blurDrawable, "setCornerRadius", cornerPx)
+        }
+
+        XposedHelpers.callMethod(blurDrawable, "setColor", Color.TRANSPARENT)
+        XposedHelpers.callMethod(blurDrawable, "setBlurRadius", 0)
+
+        val originalBg = view.background?.mutate()
+        if (originalBg != null) {
+            applyAlphaToDrawable(originalBg, PANEL_BG_ALPHA)
+            view.backgroundTintList?.let { tint ->
+                val c = tint.defaultColor
+                view.backgroundTintList = ColorStateList.valueOf(
+                    Color.argb(PANEL_BG_ALPHA, Color.red(c), Color.green(c), Color.blue(c))
+                )
+            }
+
+            val layer = LayerDrawable(arrayOf(blurDrawable, originalBg))
+            // 若原背景带有 InsetDrawable 边距，同步给模糊层防止溢出卡片外框
+            val pad = Rect()
+            if (originalBg.getPadding(pad) && (pad.left > 0 || pad.top > 0 || pad.right > 0 || pad.bottom > 0)) {
+                layer.setLayerInset(0, pad.left, pad.top, pad.right, pad.bottom)
+            }
+            view.background = layer
+        } else {
+            view.background = blurDrawable
+        }
+
+        // 启动丝滑渐进模糊动画（0px -> targetBlurRadiusPx）
+        ValueAnimator.ofInt(0, targetBlurRadiusPx).apply {
+            duration = BLUR_ANIM_DURATION_MS
+            interpolator = DecelerateInterpolator()
+            addUpdateListener { anim ->
+                try {
+                    val currentRadius = anim.animatedValue as Int
+                    XposedHelpers.callMethod(blurDrawable, "setBlurRadius", currentRadius)
+                    view.invalidate()
+                } catch (_: Throwable) {
+                }
+            }
+            start()
+        }
+    }
+
+    private fun findComposeViews(view: View, out: MutableList<View>, depth: Int) {
+        if (depth > 10) return
+        val name = view.javaClass.name
+        if (name.contains("AndroidComposeView", ignoreCase = true) ||
+            name.contains("ComposeView", ignoreCase = true)
+        ) {
+            out.add(view)
+        }
+        if (view is ViewGroup) {
+            for (i in 0 until view.childCount) {
+                findComposeViews(view.getChildAt(i), out, depth + 1)
+            }
+        }
+    }
+
+    private fun findBackgroundContainers(view: View, out: MutableList<View>, depth: Int) {
+        if (depth > 6 || view is SeekBar) return
+
+        val bg = view.background
+        if (bg != null && bg !is ColorDrawable) {
+            out.add(view)
+            if (depth >= 4) return
+        } else if (bg is ColorDrawable && Color.alpha(bg.color) > 0) {
+            out.add(view)
         }
 
         if (view is ViewGroup) {
             for (i in 0 until view.childCount) {
-                makeContainerTranslucent(view.getChildAt(i), alpha, depth + 1)
+                findBackgroundContainers(view.getChildAt(i), out, depth + 1)
             }
+        }
+    }
+
+    private fun extractCornerRadius(drawable: Drawable?): Float? {
+        if (drawable == null) return null
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && drawable is DrawableWrapper) {
+            return extractCornerRadius(drawable.drawable)
+        }
+        return when (drawable) {
+            is GradientDrawable -> if (drawable.cornerRadius > 0f) drawable.cornerRadius else null
+            is LayerDrawable -> {
+                for (i in 0 until drawable.numberOfLayers) {
+                    val r = extractCornerRadius(drawable.getDrawable(i))
+                    if (r != null) return r
+                }
+                null
+            }
+            else -> null
         }
     }
 
     private fun applyAlphaToDrawable(drawable: Drawable, alpha: Int) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && drawable is DrawableWrapper) {
+            drawable.drawable?.let { applyAlphaToDrawable(it, alpha) }
+            drawable.alpha = alpha
+            return
+        }
         when (drawable) {
             is RippleDrawable -> {
                 for (i in 0 until drawable.numberOfLayers) {
@@ -386,22 +432,51 @@ class BlurHookEntry : IXposedHookLoadPackage {
                 drawable.alpha = alpha
                 drawable.color?.let { csl ->
                     val c = csl.defaultColor
-                    if (Color.alpha(c) > alpha) {
-                        drawable.color = ColorStateList.valueOf(
-                            Color.argb(alpha, Color.red(c), Color.green(c), Color.blue(c))
-                        )
-                    }
+                    drawable.color = ColorStateList.valueOf(
+                        Color.argb(alpha, Color.red(c), Color.green(c), Color.blue(c))
+                    )
                 }
             }
             is ColorDrawable -> {
                 val c = drawable.color
-                if (Color.alpha(c) > alpha) {
-                    drawable.color = Color.argb(alpha, Color.red(c), Color.green(c), Color.blue(c))
-                }
+                drawable.color = Color.argb(alpha, Color.red(c), Color.green(c), Color.blue(c))
             }
             else -> {
                 drawable.alpha = alpha
+                // 兼容 MaterialShapeDrawable 的 fillColor
+                if (drawable.javaClass.name.contains("MaterialShapeDrawable")) {
+                    try {
+                        val fillColor = XposedHelpers.callMethod(drawable, "getFillColor") as? ColorStateList
+                        if (fillColor != null) {
+                            val c = fillColor.defaultColor
+                            XposedHelpers.callMethod(
+                                drawable,
+                                "setFillColor",
+                                ColorStateList.valueOf(Color.argb(alpha, Color.red(c), Color.green(c), Color.blue(c)))
+                            )
+                        }
+                    } catch (_: Throwable) {
+                    }
+                }
             }
         }
+    }
+
+    private fun isTargetComponent(name: String): Boolean {
+        return name.contains("Volume", ignoreCase = true) ||
+                name.contains("SystemUIDialog", ignoreCase = true) ||
+                name.contains("BottomSheet", ignoreCase = true) ||
+                name.contains("Sheet", ignoreCase = true) ||
+                name.contains("DialogWrapper", ignoreCase = true) ||
+                name.contains("QS", ignoreCase = true) ||
+                name.contains("Detail", ignoreCase = true) ||
+                name.contains("Menu", ignoreCase = true) ||
+                name.contains("Media", ignoreCase = true) ||
+                name.contains("Output", ignoreCase = true) ||
+                name.contains("Popup", ignoreCase = true)
+    }
+
+    private fun dpToPx(context: Context, dp: Float): Float {
+        return dp * context.resources.displayMetrics.density
     }
 }
